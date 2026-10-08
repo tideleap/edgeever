@@ -170,6 +170,41 @@ export async function transcribeNoteResource(
   return { text, resourceId, filename: target.filename };
 }
 
+export async function transcribeMediaBlob(
+  media: Blob,
+  signal?: AbortSignal,
+  transport: {
+    getSettings?: typeof api.getAiTranscriptionSettings;
+    getCredential?: typeof api.getAiTranscriptionDirectCredential;
+    providerFetch?: typeof fetch;
+  } = {},
+): Promise<{ text: string }> {
+  if (!(media instanceof Blob)) throw new TypeError("A media Blob or File is required.");
+  if (!Number.isSafeInteger(media.size) || media.size < 1 || media.size > MAX_SOURCE_BYTES) {
+    throw new Error("The media is unavailable or exceeds the 1 GiB limit.");
+  }
+  signal?.throwIfAborted();
+  const settings = await (transport.getSettings ?? api.getAiTranscriptionSettings)();
+  signal?.throwIfAborted();
+  const provider = settings.providers.find((item) => item.isEnabled
+    && item.models.some((model) => model.id === settings.defaultModelId));
+  const model = provider?.models.find((item) => item.id === settings.defaultModelId);
+  if (!settings.enabled || !provider || !model || !provider.hasApiKey) {
+    throw new Error("No speech recognition model is enabled.");
+  }
+  const { apiKey } = await (transport.getCredential ?? api.getAiTranscriptionDirectCredential)(provider.id, signal);
+  signal?.throwIfAborted();
+  const readRange = async (start: number, end: number) =>
+    new Uint8Array(await media.slice(start, end).arrayBuffer());
+  const text = await transcribePreparedAudioParts(
+    { baseUrl: provider.baseUrl.trim().replace(/\/+$/, ""), modelId: model.modelId, apiKey },
+    extractAudioParts(media.size, readRange, signal),
+    transport.providerFetch ?? directProviderFetch,
+    signal,
+  );
+  return { text };
+}
+
 export async function transcribePreparedAudioParts(
   target: { baseUrl: string; modelId: string; apiKey: string },
   parts: AsyncIterable<File>,
@@ -214,16 +249,22 @@ export async function transcribePreparedAudioParts(
 export async function testSpeechService(
   target: { baseUrl: string; modelId: string; apiKey: string },
   signal?: AbortSignal,
-  transport: { sampleFetch?: typeof fetch; providerFetch?: typeof fetch } = {},
+  transport: { sampleFetch?: typeof fetch; providerFetch?: typeof fetch; sampleLocale?: string } = {},
 ): Promise<string> {
+  const sampleFilename = transport.sampleLocale?.toLowerCase().startsWith("zh")
+    ? "speech-service-check.zh-CN.mp3"
+    : "speech-service-check.en-US.mp3";
+  const sampleUrl = sampleFilename === "speech-service-check.zh-CN.mp3"
+    ? new URL("./fixtures/speech-service-check.zh-CN.mp3", import.meta.url)
+    : new URL("./fixtures/speech-service-check.en-US.mp3", import.meta.url);
   const sampleResponse = await (transport.sampleFetch ?? fetch)(
-    new URL("./fixtures/speech-service-check.mp3", import.meta.url),
+    sampleUrl,
     { signal },
   );
   if (!sampleResponse.ok) throw new Error("The built-in speech test audio is unavailable.");
   const sample = new File(
     [await sampleResponse.arrayBuffer()],
-    "speech-service-check.mp3",
+    sampleFilename,
     { type: "audio/mpeg" },
   );
   async function* parts() { yield sample; }
